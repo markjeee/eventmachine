@@ -825,3 +825,32 @@ extern "C" int evma_set_heartbeat_interval(float interval)
 	ensure_eventmachine("evma_set_heartbeat_interval");
 	return EventMachine->SetHeartbeatInterval(interval);
 }
+
+/**************
+evma_attach_acceptor
+**************/
+
+extern "C" const unsigned long evma_attach_acceptor (int file_descriptor)
+{
+	ensure_eventmachine("evma_attach_acceptor");
+	return EventMachine->AttachAcceptor (file_descriptor);
+}
+
+/**************
+evma_detach_acceptor
+**************/
+
+extern "C" int evma_detach_acceptor (const unsigned long binding)
+{
+	ensure_eventmachine("evma_detach_acceptor");
+	EventableDescriptor *ed = dynamic_cast <EventableDescriptor*> (Bindable_t::GetObject (binding));
+	if (ed)
+		return EventMachine->DetachAcceptor (ed);
+	else
+		#ifdef BUILD_FOR_RUBY
+			rb_raise(rb_eRuntimeError, "invalid binding to detach");
+		#else
+			throw std::runtime_error ("invalid binding to detach");
+		#endif
+}
+
