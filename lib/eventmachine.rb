@@ -181,7 +181,7 @@ require 'thread'
 # Interesting thought.
 #
 module EventMachine
-  class <<self
+  class << self
     # Exposed to allow joining on the thread, when run in a multithreaded
     # environment. Performing other actions on the thread has undefined
     # semantics.
@@ -803,6 +803,17 @@ module EventMachine
     c
   end
 
+  def EventMachine::accept sock, handler = nil, *args, &block
+    klass = klass_from_handler(Connection, handler, *args)
+
+    s = attach_acceptor(sock.fileno)
+    @acceptors[s] = [klass,args,block]
+    s
+  end
+
+  def EventMachine::stop_accept(signature)
+    detach_acceptor(signature)
+  end
 
   # Connect to a given host/port and re-use the provided EventMachine::Connection instance
   #--

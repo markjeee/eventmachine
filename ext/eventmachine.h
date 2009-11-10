@@ -46,6 +46,9 @@ extern "C" {
 	const unsigned long evma_connect_to_server (const char *bind_addr, int bind_port, const char *server, int port);
 	const unsigned long evma_connect_to_unix_server (const char *server);
 
+	const unsigned long evma_attach_acceptor (int file_descriptor);
+	int evma_detach_acceptor (const unsigned long binding);
+
 	const unsigned long evma_attach_fd (int file_descriptor, int watch_mode);
 	int evma_detach_fd (const unsigned long binding);
 	int evma_get_file_descriptor (const unsigned long binding);

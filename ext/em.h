@@ -106,6 +106,11 @@ class EventMachine_t
 		const unsigned long AttachFD (int, bool);
 		int DetachFD (EventableDescriptor*);
 
+        // this add existing, binded acceptor to EventMachine
+        // added by: mjwork@simpleteq.com
+        const unsigned long AttachAcceptor(int);
+        int DetachAcceptor(EventableDescriptor *);
+
 		void ArmKqueueWriter (EventableDescriptor*);
 		void ArmKqueueReader (EventableDescriptor*);
 

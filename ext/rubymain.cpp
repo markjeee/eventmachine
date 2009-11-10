@@ -1027,6 +1027,26 @@ static VALUE t_set_heartbeat_interval (VALUE self, VALUE interval)
 	return Qfalse;
 }
 
+/***********
+t_attach_fd
+***********/
+
+static VALUE t_attach_acceptor (VALUE self, VALUE acceptor)
+{
+	const unsigned long f = evma_attach_acceptor (NUM2INT(acceptor));
+	if (!f)
+		rb_raise (rb_eRuntimeError, "no acceptor");
+	return ULONG2NUM (f);
+}
+
+/***********
+t_detach_fd
+***********/
+
+static VALUE t_detach_acceptor (VALUE self, VALUE signature)
+{
+	return INT2NUM(evma_detach_acceptor (NUM2ULONG (signature)));
+}
 
 /*********************
 Init_rubyeventmachine
@@ -1084,6 +1104,9 @@ extern "C" void Init_rubyeventmachine()
 	rb_define_module_function (EmModule, "connect_server", (VALUE(*)(...))t_connect_server, 2);
 	rb_define_module_function (EmModule, "bind_connect_server", (VALUE(*)(...))t_bind_connect_server, 4);
 	rb_define_module_function (EmModule, "connect_unix_server", (VALUE(*)(...))t_connect_unix_server, 1);
+
+	rb_define_module_function (EmModule, "attach_acceptor", (VALUE (*)(...))t_attach_acceptor, 1);
+	rb_define_module_function (EmModule, "detach_acceptor", (VALUE (*)(...))t_detach_acceptor, 1);
 
 	rb_define_module_function (EmModule, "attach_fd", (VALUE (*)(...))t_attach_fd, 2);
 	rb_define_module_function (EmModule, "detach_fd", (VALUE (*)(...))t_detach_fd, 1);

@@ -1433,7 +1433,6 @@ struct sockaddr *name2address (const char *server, int port, int *family, int *b
 	return NULL;
 }
 
-
 /*******************************
 EventMachine_t::CreateTcpServer
 *******************************/
@@ -2279,4 +2278,61 @@ int EventMachine_t::SetHeartbeatInterval(float interval)
 	return 0;
 }
 //#endif // OS_UNIX
+
+// this add existing, binded acceptor to EventMachine
+// added by: mjwork@simpleteq.com
+//const unsigned long AttachDescriptor(int);
+//int DetachDescriptor(AcceptorDescriptor *);
+const unsigned long EventMachine_t::AttachAcceptor(int fd)
+{
+    unsigned long output_binding = NULL;
+    
+    // START - copied code from AttachFD    
+	#ifdef OS_UNIX
+	if (fcntl(fd, F_GETFL, 0) < 0)
+		throw std::runtime_error ("invalid file descriptor");
+	#endif
+
+	#ifdef OS_WIN32
+	// TODO: add better check for invalid file descriptors (see ioctlsocket or getsockopt)
+	if (fd == INVALID_SOCKET)
+		throw std::runtime_error ("invalid file descriptor");
+	#endif
+
+	{// Check for duplicate descriptors
+		size_t i;
+		for (i = 0; i < Descriptors.size(); i++) {
+			EventableDescriptor *ed = Descriptors[i];
+			assert (ed);
+			if (ed->GetSocket() == fd)
+				throw std::runtime_error ("adding existing descriptor");
+		}
+
+		for (i = 0; i < NewDescriptors.size(); i++) {
+			EventableDescriptor *ed = NewDescriptors[i];
+			assert (ed);
+			if (ed->GetSocket() == fd)
+				throw std::runtime_error ("adding existing new descriptor");
+		}
+	}
+    // END - copied code from AttachFD
+    
+    // START - copied code from CreateTcpServer	
+	{ // Looking good.
+		AcceptorDescriptor *ad = new AcceptorDescriptor (fd, this);
+		if (!ad)
+			throw std::runtime_error ("unable to allocate acceptor");
+		Add (ad);
+		output_binding = ad->GetBinding();
+	}
+    
+	return output_binding;
+	// END - copied code from CreateTcpServer
+}
+
+// the detach process is the same as the DetachFD mechanism
+int EventMachine_t::DetachAcceptor(EventableDescriptor *ed)
+{
+    return this->DetachFD(ed);
+}
 
