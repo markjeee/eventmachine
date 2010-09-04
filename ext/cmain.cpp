@@ -25,6 +25,7 @@ See the file COPYING for complete licensing information.
 */
 #if defined(BUILD_FOR_RUBY) && defined(OS_WIN32)
 #undef stat
+#undef fstat
 #endif
 
 static EventMachine_t *EventMachine;
@@ -148,6 +149,7 @@ extern "C" int evma_detach_fd (const unsigned long binding)
 		#else
 			throw std::runtime_error ("invalid binding to detach");
 		#endif
+			return -1;
 }
 
 /************************
@@ -166,6 +168,7 @@ extern "C" int evma_get_file_descriptor (const unsigned long binding)
 		#else
 			throw std::runtime_error ("invalid binding to get_fd");
 		#endif
+			return -1;
 }
 
 /***********************
@@ -340,7 +343,10 @@ evma_send_data_to_connection
 extern "C" int evma_send_data_to_connection (const unsigned long binding, const char *data, int data_length)
 {
 	ensure_eventmachine("evma_send_data_to_connection");
-	return ConnectionDescriptor::SendDataToConnection (binding, data, data_length);
+	EventableDescriptor *ed = dynamic_cast <EventableDescriptor*> (Bindable_t::GetObject (binding));
+	if (ed)
+		return ed->SendOutboundData(data, data_length);
+	return -1;
 }
 
 /******************
@@ -350,7 +356,10 @@ evma_send_datagram
 extern "C" int evma_send_datagram (const unsigned long binding, const char *data, int data_length, const char *address, int port)
 {
 	ensure_eventmachine("evma_send_datagram");
-	return DatagramDescriptor::SendDatagram (binding, data, data_length, address, port);
+	DatagramDescriptor *dd = dynamic_cast <DatagramDescriptor*> (Bindable_t::GetObject (binding));
+	if (dd)
+		return dd->SendOutboundDatagram(data, data_length, address, port);
+	return -1;
 }
 
 
@@ -361,7 +370,9 @@ evma_close_connection
 extern "C" void evma_close_connection (const unsigned long binding, int after_writing)
 {
 	ensure_eventmachine("evma_close_connection");
-	ConnectionDescriptor::CloseConnection (binding, (after_writing ? true : false));
+	EventableDescriptor *ed = dynamic_cast <EventableDescriptor*> (Bindable_t::GetObject (binding));
+	if (ed)
+		ed->ScheduleClose (after_writing ? true : false);
 }
 
 /***********************************
@@ -371,7 +382,10 @@ evma_report_connection_error_status
 extern "C" int evma_report_connection_error_status (const unsigned long binding)
 {
 	ensure_eventmachine("evma_report_connection_error_status");
-	return ConnectionDescriptor::ReportErrorStatus (binding);
+	EventableDescriptor *ed = dynamic_cast <EventableDescriptor*> (Bindable_t::GetObject (binding));
+	if (ed)
+		return ed->ReportErrorStatus();
+	return -1;
 }
 
 /********************
@@ -559,7 +573,7 @@ extern "C" float evma_get_comm_inactivity_timeout (const unsigned long binding)
 	ensure_eventmachine("evma_get_comm_inactivity_timeout");
 	EventableDescriptor *ed = dynamic_cast <EventableDescriptor*> (Bindable_t::GetObject (binding));
 	if (ed) {
-		return ed->GetCommInactivityTimeout();
+		return ((float)ed->GetCommInactivityTimeout() / 1000);
 	}
 	else
 		return 0.0; //Perhaps this should be an exception. Access to an unknown binding.
@@ -574,7 +588,7 @@ extern "C" int evma_set_comm_inactivity_timeout (const unsigned long binding, fl
 	ensure_eventmachine("evma_set_comm_inactivity_timeout");
 	EventableDescriptor *ed = dynamic_cast <EventableDescriptor*> (Bindable_t::GetObject (binding));
 	if (ed) {
-		return ed->SetCommInactivityTimeout (value);
+		return ed->SetCommInactivityTimeout ((uint64_t)(value * 1000));
 	}
 	else
 		return 0; //Perhaps this should be an exception. Access to an unknown binding.
@@ -590,7 +604,7 @@ extern "C" float evma_get_pending_connect_timeout (const unsigned long binding)
 	ensure_eventmachine("evma_get_pending_connect_timeout");
 	EventableDescriptor *ed = dynamic_cast <EventableDescriptor*> (Bindable_t::GetObject (binding));
 	if (ed) {
-		return ed->GetPendingConnectTimeout();
+		return ((float)ed->GetPendingConnectTimeout() / 1000);
 	}
 	else
 		return 0.0;
@@ -606,7 +620,7 @@ extern "C" int evma_set_pending_connect_timeout (const unsigned long binding, fl
 	ensure_eventmachine("evma_set_pending_connect_timeout");
 	EventableDescriptor *ed = dynamic_cast <EventableDescriptor*> (Bindable_t::GetObject (binding));
 	if (ed) {
-		return ed->SetPendingConnectTimeout (value);
+		return ed->SetPendingConnectTimeout ((uint64_t)(value * 1000));
 	}
 	else
 		return 0;
@@ -783,12 +797,12 @@ extern "C" int evma_send_file_data_to_connection (const unsigned long binding, c
 evma_start_proxy
 *****************/
 
-extern "C" void evma_start_proxy (const unsigned long from, const unsigned long to, const unsigned long bufsize)
+extern "C" void evma_start_proxy (const unsigned long from, const unsigned long to, const unsigned long bufsize, const unsigned long length)
 {
 	ensure_eventmachine("evma_start_proxy");
 	EventableDescriptor *ed = dynamic_cast <EventableDescriptor*> (Bindable_t::GetObject (from));
 	if (ed)
-		ed->StartProxy(to, bufsize);
+		ed->StartProxy(to, bufsize, length);
 }
 
 
@@ -854,3 +868,12 @@ extern "C" int evma_detach_acceptor (const unsigned long binding)
 		#endif
 }
 
+/**************************
+evma_get_current_loop_time
+***************************/
+
+extern "C" uint64_t evma_get_current_loop_time()
+{
+	ensure_eventmachine("evma_get_current_loop_time");
+	return EventMachine->GetCurrentLoopTime();
+}

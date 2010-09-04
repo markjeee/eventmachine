@@ -36,7 +36,7 @@ module EventMachine
       allocate.instance_eval do
         # Store signature
         @signature = sig
-        associate_callback_target sig
+        # associate_callback_target sig
 
         # Call a superclass's #initialize if it has one
         initialize(*args)
@@ -132,6 +132,11 @@ module EventMachine
     # to relay incoming data to a descriptor (set as a proxy target descriptor with
     # EventMachine::enable_proxy) that has already been closed.
     def proxy_target_unbound
+    end
+
+    # EventMachine::Connection#proxy_completed is called when the reactor finished proxying all
+    # of the requested bytes.
+    def proxy_completed
     end
 
     # EventMachine::Connection#proxy_incoming_to is called only by user code. It sets up

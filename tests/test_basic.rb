@@ -30,44 +30,17 @@ require 'socket'
 require 'test/unit'
 
 class TestBasic < Test::Unit::TestCase
-
-  def setup
-    assert(!EM.reactor_running?)
-  end
-
-  def teardown
-    assert(!EM.reactor_running?)
-  end
-
-  #-------------------------------------
-
-  def test_libtype
-    lt = EventMachine.library_type
-    em_lib = (ENV["EVENTMACHINE_LIBRARY"] || $eventmachine_library || :xxx).to_sym
-
-    # Running from test runner, under jruby.
-    if RUBY_PLATFORM == 'java'
-      unless em_lib == :pure_ruby
-        assert_equal( :java, lt )
-        return
-      end
-    end
-
-    case em_lib
-    when :pure_ruby
-      assert_equal( :pure_ruby, lt )
-    when :extension
-      assert_equal( :extension, lt )
-    when :java
-      assert_equal( :java, lt )
-    else
-      # Running from jruby as a standalone test.
-      if RUBY_PLATFORM == 'java'
-        assert_equal( :java, lt )
-      else
-        assert_equal( :extension, lt )
-      end
-    end
+  def test_connection_class_cache
+    mod = Module.new
+    a, b = nil, nil
+    EM.run {
+      EM.start_server '127.0.0.1', 9999, mod
+      a = EM.connect '127.0.0.1', 9999, mod
+      b = EM.connect '127.0.0.1', 9999, mod
+      EM.stop
+    }
+    assert_equal a.class, b.class
+    assert_kind_of EM::Connection, a
   end
 
   #-------------------------------------
@@ -123,20 +96,11 @@ class TestBasic < Test::Unit::TestCase
     assert !EM.reactor_running?
   end
 
-
-  #--------------------------------------
-
-  # TODO! This is an unfinished edge case.
-  # EM mishandles uncaught Ruby exceptions that fire from within #unbind handlers.
-  # A uncaught Ruby exception results in a call to EM::release_machine (which is in an ensure
-  # block in EM::run). But if EM is processing an unbind request, the release_machine call
-  # will cause a segmentation fault.
-  #
-
   TestHost = "127.0.0.1"
   TestPort = 9070
 
   class UnbindError < EM::Connection
+    ERR = Class.new(StandardError)
     def initialize *args
       super
     end
@@ -144,58 +108,17 @@ class TestBasic < Test::Unit::TestCase
       close_connection_after_writing
     end
     def unbind
-      raise "Blooey"
+      raise ERR
     end
   end
 
-  def xxx_test_unbind_error
-    assert_raises( RuntimeError ) {
+  def test_unbind_error
+    assert_raises( UnbindError::ERR ) {
       EM.run {
         EM.start_server TestHost, TestPort
         EM.connect TestHost, TestPort, UnbindError
       }
     }
-  end
-
-  #------------------------------------
-  #
-  # TODO. This is an unfinished bug fix.
-  # This case was originally reported by Dan Aquino. If you throw a Ruby exception
-  # in a post_init handler, it gets rethrown as a confusing reactor exception.
-  # The problem is in eventmachine.rb, which calls post_init within the private
-  # initialize method of the EM::Connection class. This happens in both the EM::connect
-  # method and in the code that responds to connection-accepted events.
-  # What happens is that we instantiate the new connection object, which calls
-  # initialize, and then after initialize returns, we stick the new connection object
-  # into EM's @conns hashtable.
-  # But the problem is that Connection::initialize calls #post_init before it returns,
-  # and this may be user-written code that may throw an uncaught Ruby exception.
-  # If that happens, the reactor will abort, and it will then try to run down open
-  # connections. Because @conns never got a chance to properly reflect the new connection
-  # (because initialize never returned), we throw a ConnectionNotBound error
-  # (eventmachine.rb line 1080).
-  # When the bug is fixed, activate this test case.
-  #
-
-  class PostInitError < EM::Connection
-    def post_init
-      aaa bbb # should produce a Ruby exception
-    end
-  end
-  # This test causes issues, the machine becomes unreleasable after 
-  # release_machine suffers an exception in event_callback.
-  def xxx_test_post_init_error
-    assert_raises( EventMachine::ConnectionNotBound ) {
-      EM.run {
-        EM::Timer.new(1) {EM.stop}
-        EM.start_server TestHost, TestPort
-        EM.connect TestHost, TestPort, PostInitError
-      }
-    }
-    EM.run {
-      EM.stop
-    }
-    assert !EM.reactor_running?
   end
 
   module BrsTestSrv
@@ -213,6 +136,15 @@ class TestBasic < Test::Unit::TestCase
     end
   end
 
+  def setup_timeout(timeout = 4)
+    EM.schedule {
+      start_time = EM.current_time
+      EM.add_periodic_timer(0.01) {
+        raise "timeout" if EM.current_time - start_time >= timeout
+      }
+    }
+  end
+
   # From ticket #50
   def test_byte_range_send
     $received = ''
@@ -221,7 +153,7 @@ class TestBasic < Test::Unit::TestCase
       EM::start_server TestHost, TestPort, BrsTestSrv
       EM::connect TestHost, TestPort, BrsTestCli
 
-      EM::add_timer(0.5) { assert(false, 'test timed out'); EM.stop; Kernel.warn "test timed out!" }
+      setup_timeout
     }
     assert_equal($sent, $received)
   end
@@ -280,5 +212,38 @@ class TestBasic < Test::Unit::TestCase
     }
     assert_equal(interval, $interval)
   end
+  
+  module PostInitRaiser
+    ERR = Class.new(StandardError)
+    def post_init
+      raise ERR
+    end
+  end
+  
+  def test_bubble_errors_from_post_init
+    localhost, port = '127.0.0.1', 9000
+    assert_raises(PostInitRaiser::ERR) do
+      EM.run do
+        EM.start_server localhost, port
+        EM.connect localhost, port, PostInitRaiser
+      end
+    end
+  end
+  
+  module InitializeRaiser
+    ERR = Class.new(StandardError)
+    def initialize
+      raise ERR
+    end
+  end
+  
+  def test_bubble_errors_from_initialize
+    localhost, port = '127.0.0.1', 9000
+    assert_raises(InitializeRaiser::ERR) do
+      EM.run do
+        EM.start_server localhost, port
+        EM.connect localhost, port, InitializeRaiser
+      end
+    end
+  end
 end
-

@@ -1,75 +1,12 @@
-#--
-#
-# Author:: Francis Cianfrocca (gmail: blackhedd)
-# Homepage::  http://rubyeventmachine.com
-# Date:: 8 Apr 2006
-# 
-# See EventMachine and EventMachine::Connection for documentation and
-# usage examples.
-#
-#----------------------------------------------------------------------------
-#
-# Copyright (C) 2006-07 by Francis Cianfrocca. All Rights Reserved.
-# Gmail: blackhedd
-# 
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of either: 1) the GNU General Public License
-# as published by the Free Software Foundation; either version 2 of the
-# License, or (at your option) any later version; or 2) Ruby's License.
-# 
-# See the file COPYING for complete licensing information.
-#
-#---------------------------------------------------------------------------
-#
-# 
-
-
-#-- Select in a library based on a global variable.
-# PROVISIONALLY commented out this whole mechanism which selects
-# a pure-Ruby EM implementation if the extension is not available.
-# I expect this will cause a lot of people's code to break, as it
-# exposes misconfigurations and path problems that were masked up
-# till now. The reason I'm disabling it is because the pure-Ruby
-# code will have problems of its own, and it's not nearly as fast
-# anyway. Suggested by a problem report from Moshe Litvin. 05Jun07.
-#
-# 05Dec07: Re-enabled the pure-ruby mechanism, but without the automatic
-# fallback feature that tripped up Moshe Litvin. We shouldn't fail over to
-# the pure Ruby version because it's possible that the user intended to
-# run the extension but failed to do so because of a compilation or
-# similar error. So we require either a global variable or an environment
-# string be set in order to select the pure-Ruby version.
-#
-
-
-unless defined?($eventmachine_library)
-  $eventmachine_library = ENV['EVENTMACHINE_LIBRARY'] || :cascade
-end
-$eventmachine_library = $eventmachine_library.to_sym
-
-case $eventmachine_library
-when :pure_ruby
-  require 'pr_eventmachine'
-when :extension
-  require 'rubyeventmachine'
-when :java
+if RUBY_PLATFORM =~ /java/
+  require 'java'
   require 'jeventmachine'
-else # :cascade
-  # This is the case that most user code will take.
-  # Prefer the extension if available.
+else
   begin
-    if RUBY_PLATFORM =~ /java/
-      require 'java'
-      require 'jeventmachine'
-      $eventmachine_library = :java
-    else
-      require 'rubyeventmachine'
-      $eventmachine_library = :extension
-    end
+    require 'rubyeventmachine'
   rescue LoadError
-    warn "# EventMachine fell back to pure ruby mode" if $DEBUG
-    require 'pr_eventmachine'
-    $eventmachine_library = :pure_ruby
+    warn "Unable to load the EventMachine C extension; To use the pure-ruby reactor, require 'em/pure_ruby'"
+    raise
   end
 end
 
@@ -79,6 +16,7 @@ require 'em/future'
 require 'em/streamer'
 require 'em/spawnable'
 require 'em/processes'
+require 'em/iterator'
 require 'em/buftok'
 require 'em/timers'
 require 'em/protocols'
@@ -88,6 +26,7 @@ require 'em/queue'
 require 'em/channel'
 require 'em/file_watch'
 require 'em/process_watch'
+require 'em/tick_loop'
 
 require 'shellwords'
 require 'thread'
@@ -1065,6 +1004,7 @@ module EventMachine
   def self.spawn_threadpool # :nodoc:
     until @threadpool.size == @threadpool_size.to_i
       thread = Thread.new do
+        Thread.current.abort_on_exception = true
         while true
           op, cback = *@threadqueue.pop
           result = op.call
@@ -1379,8 +1319,8 @@ module EventMachine
   #  EM.run {
   #    EM.start_server("127.0.0.1", 8080, ProxyServer)
   #  }
-  def self.enable_proxy(from, to, bufsize=0)
-    EM::start_proxy(from.signature, to.signature, bufsize)
+  def self.enable_proxy(from, to, bufsize=0, length=0)
+    EM::start_proxy(from.signature, to.signature, bufsize, length)
   end
 
   # disable_proxy takes just one argument, a Connection that has proxying enabled via enable_proxy.
@@ -1432,7 +1372,12 @@ module EventMachine
       elsif c = @acceptors.delete( conn_binding )
         # no-op
       else
-        raise ConnectionNotBound, "recieved ConnectionUnbound for an unknown signature: #{conn_binding}"
+        if $! # Bubble user generated errors.
+          @wrapped_exception = $!
+          EM.stop
+        else
+          raise ConnectionNotBound, "recieved ConnectionUnbound for an unknown signature: #{conn_binding}"
+        end
       end
     elsif opcode == ConnectionAccepted
       accep,args,blk = @acceptors[conn_binding]
@@ -1582,7 +1527,11 @@ module EventMachine
       raise ArgumentError, "must provide module or subclass of #{klass.name}" unless klass >= handler
       handler
     elsif handler
-      Class.new(klass){ include handler }
+      begin
+        handler::EM_CONNECTION_CLASS
+      rescue NameError
+        handler::const_set(:EM_CONNECTION_CLASS, Class.new(klass) {include handler})
+      end
     else
       klass
     end

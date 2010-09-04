@@ -22,17 +22,6 @@ See the file COPYING for complete licensing information.
 
 #include "project.h"
 
-// Keep a global variable floating around
-// with the current loop time as set by the Event Machine.
-// This avoids the need for frequent expensive calls to time(NULL);
-Int64 gCurrentLoopTime;
-
-#ifdef OS_WIN32
-unsigned gTickCountTickover;
-unsigned gLastTickCount;
-#endif
-
-
 /* The numer of max outstanding timers was once a const enum defined in em.h.
  * Now we define it here so that users can change its value if necessary.
  */
@@ -315,7 +304,7 @@ void EventMachine_t::_InitializeLoopBreaker()
 	#ifdef OS_UNIX
 	int fd[2];
 	if (pipe (fd))
-		throw std::runtime_error ("no loop breaker");
+		throw std::runtime_error (strerror(errno));
 
 	LoopBreakerWriter = fd[1];
 	LoopBreakerReader = fd[0];
@@ -352,21 +341,76 @@ EventMachine_t::_UpdateTime
 
 void EventMachine_t::_UpdateTime()
 {
+	MyCurrentLoopTime = GetRealTime();
+}
+
+/***************************
+EventMachine_t::GetRealTime
+***************************/
+
+uint64_t EventMachine_t::GetRealTime()
+{
+	uint64_t current_time;
 	#if defined(OS_UNIX)
 	struct timeval tv;
 	gettimeofday (&tv, NULL);
-	gCurrentLoopTime = (((Int64)(tv.tv_sec)) * 1000000LL) + ((Int64)(tv.tv_usec));
+	current_time = (((uint64_t)(tv.tv_sec)) * 1000000LL) + ((uint64_t)(tv.tv_usec));
 
 	#elif defined(OS_WIN32)
 	unsigned tick = GetTickCount();
-	if (tick < gLastTickCount)
-		gTickCountTickover += 1;
-	gLastTickCount = tick;
-	gCurrentLoopTime = ((Int64)gTickCountTickover << 32) + (Int64)tick;
+	if (tick < LastTickCount)
+		TickCountTickover += 1;
+	LastTickCount = tick;
+	current_time = ((uint64_t)TickCountTickover << 32) + (uint64_t)tick;
 
 	#else
-	gCurrentLoopTime = (Int64)time(NULL) * 1000000LL;
+	current_time = (uint64_t)time(NULL) * 1000000LL;
 	#endif
+	return current_time;
+}
+
+/***********************************
+EventMachine_t::_DispatchHeartbeats
+***********************************/
+
+void EventMachine_t::_DispatchHeartbeats()
+{
+	while (true) {
+		multimap<uint64_t,EventableDescriptor*>::iterator i = Heartbeats.begin();
+		if (i == Heartbeats.end())
+			break;
+		if (i->first > MyCurrentLoopTime)
+			break;
+		EventableDescriptor *ed = i->second;
+		ed->Heartbeat();
+		QueueHeartbeat(ed);
+	}
+}
+
+/******************************
+EventMachine_t::QueueHeartbeat
+******************************/
+
+void EventMachine_t::QueueHeartbeat(EventableDescriptor *ed)
+{
+	uint64_t heartbeat = ed->GetNextHeartbeat();
+
+	if (heartbeat) {
+		#ifndef HAVE_MAKE_PAIR
+		Heartbeats.insert (multimap<uint64_t,EventableDescriptor*>::value_type (heartbeat, ed));
+		#else
+		Heartbeats.insert (make_pair (heartbeat, ed));
+		#endif
+	}
+}
+
+/******************************
+EventMachine_t::ClearHeartbeat
+******************************/
+
+void EventMachine_t::ClearHeartbeat(uint64_t key)
+{
+	Heartbeats.erase(key);
 }
 
 /*******************
@@ -446,12 +490,16 @@ EventMachine_t::_RunOnce
 
 bool EventMachine_t::_RunOnce()
 {
+	bool ret;
 	if (bEpoll)
-		return _RunEpollOnce();
+		ret = _RunEpollOnce();
 	else if (bKqueue)
-		return _RunKqueueOnce();
+		ret = _RunKqueueOnce();
 	else
-		return _RunSelectOnce();
+		ret = _RunSelectOnce();
+	_DispatchHeartbeats();
+	_CleanupSockets();
+	return ret;
 }
 
 
@@ -466,12 +514,31 @@ bool EventMachine_t::_RunEpollOnce()
 	assert (epfd != -1);
 	int s;
 
+	timeval tv = _TimeTilNextEvent();
+
 	#ifdef BUILD_FOR_RUBY
+	int ret = 0;
+	fd_set fdreads;
+
+	FD_ZERO(&fdreads);
+	FD_SET(epfd, &fdreads);
+
+	if ((ret = rb_thread_select(epfd + 1, &fdreads, NULL, NULL, &tv)) < 1) {
+		if (ret == -1) {
+			assert(errno != EINVAL);
+			assert(errno != EBADF);
+		}
+		return true;
+	}
+
 	TRAP_BEG;
-	#endif
-	s = epoll_wait (epfd, epoll_events, MaxEvents, 50);
-	#ifdef BUILD_FOR_RUBY
+	s = epoll_wait (epfd, epoll_events, MaxEvents, 0);
 	TRAP_END;
+	#else
+	int duration = 0;
+	duration = duration + (tv.tv_sec * 1000);
+	duration = duration + (tv.tv_usec / 1000);
+	s = epoll_wait (epfd, epoll_events, MaxEvents, duration);
 	#endif
 
 	if (s > 0) {
@@ -500,72 +567,6 @@ bool EventMachine_t::_RunEpollOnce()
 		EmSelect (0, NULL, NULL, NULL, &tv);
 	}
 
-	{ // cleanup dying sockets
-		// vector::pop_back works in constant time.
-		// TODO, rip this out and only delete the descriptors we know have died,
-		// rather than traversing the whole list.
-		//  Modified 05Jan08 per suggestions by Chris Heath. It's possible that
-		//  an EventableDescriptor will have a descriptor value of -1. That will
-		//  happen if EventableDescriptor::Close was called on it. In that case,
-		//  don't call epoll_ctl to remove the socket's filters from the epoll set.
-		//  According to the epoll docs, this happens automatically when the
-		//  descriptor is closed anyway. This is different from the case where
-		//  the socket has already been closed but the descriptor in the ED object
-		//  hasn't yet been set to INVALID_SOCKET.
-		int i, j;
-		int nSockets = Descriptors.size();
-		for (i=0, j=0; i < nSockets; i++) {
-			EventableDescriptor *ed = Descriptors[i];
-			assert (ed);
-			if (ed->ShouldDelete()) {
-				if (ed->GetSocket() != INVALID_SOCKET) {
-					assert (bEpoll); // wouldn't be in this method otherwise.
-					assert (epfd != -1);
-					int e = epoll_ctl (epfd, EPOLL_CTL_DEL, ed->GetSocket(), ed->GetEpollEvent());
-					// ENOENT or EBADF are not errors because the socket may be already closed when we get here.
-					if (e && (errno != ENOENT) && (errno != EBADF) && (errno != EPERM)) {
-						char buf [200];
-						snprintf (buf, sizeof(buf)-1, "unable to delete epoll event: %s", strerror(errno));
-						throw std::runtime_error (buf);
-					}
-				}
-
-				ModifiedDescriptors.erase (ed);
-				delete ed;
-			}
-			else
-				Descriptors [j++] = ed;
-		}
-		while ((size_t)j < Descriptors.size())
-			Descriptors.pop_back();
-
-	}
-
-	// TODO, heartbeats.
-	// Added 14Sep07, its absence was noted by Brian Candler. But the comment was here, indicated
-	// that this got thought about and not done when EPOLL was originally written. Was there a reason
-	// not to do it, or was it an oversight? Certainly, running a heartbeat on 50,000 connections every
-	// two seconds can get to be a real bear, especially if all we're doing is timing out dead ones.
-	// Maybe there's a better way to do this. (Or maybe it's not that expensive after all.)
-	//
-	{ // dispatch heartbeats
-		if (gCurrentLoopTime >= NextHeartbeatTime) {
-			NextHeartbeatTime = gCurrentLoopTime + HeartbeatInterval;
-
-			for (int i=0; i < Descriptors.size(); i++) {
-				EventableDescriptor *ed = Descriptors[i];
-				assert (ed);
-				ed->Heartbeat();
-			}
-		}
-	}
-
-	#ifdef BUILD_FOR_RUBY
-	if (!rb_thread_alone()) {
-		rb_thread_schedule();
-	}
-	#endif
-
 	return true;
 	#else
 	throw std::runtime_error ("epoll is not implemented on this platform");
@@ -581,15 +582,29 @@ bool EventMachine_t::_RunKqueueOnce()
 {
 	#ifdef HAVE_KQUEUE
 	assert (kqfd != -1);
-	struct timespec ts = {0, 10000000}; // Too frequent. Use blocking_region
-
 	int k;
+
+	timeval tv = _TimeTilNextEvent();
+
 	#ifdef BUILD_FOR_RUBY
+	int ret = 0;
+	fd_set fdreads;
+
+	FD_ZERO(&fdreads);
+	FD_SET(kqfd, &fdreads);
+
+	if ((ret = rb_thread_select(kqfd + 1, &fdreads, NULL, NULL, &tv)) < 1) {
+		return true;
+	}
+
 	TRAP_BEG;
-	#endif
-	k = kevent (kqfd, NULL, 0, Karray, MaxEvents, &ts);
-	#ifdef BUILD_FOR_RUBY
+	k = kevent (kqfd, NULL, 0, Karray, MaxEvents, NULL);
 	TRAP_END;
+	#else
+	struct timespec ts;
+	ts.tv_sec = tv.tv_sec;
+	ts.tv_nsec = tv.tv_usec * 1000;
+	k = kevent (kqfd, NULL, 0, Karray, MaxEvents, &ts);
 	#endif
 
 	struct kevent *ke = Karray;
@@ -626,42 +641,6 @@ bool EventMachine_t::_RunKqueueOnce()
 		++ke;
 	}
 
-	{ // cleanup dying sockets
-		// vector::pop_back works in constant time.
-		// TODO, rip this out and only delete the descriptors we know have died,
-		// rather than traversing the whole list.
-		// In kqueue, closing a descriptor automatically removes its event filters.
-
-		int i, j;
-		int nSockets = Descriptors.size();
-		for (i=0, j=0; i < nSockets; i++) {
-			EventableDescriptor *ed = Descriptors[i];
-			assert (ed);
-			if (ed->ShouldDelete()) {
-				ModifiedDescriptors.erase (ed);
-				delete ed;
-			}
-			else
-				Descriptors [j++] = ed;
-		}
-		while ((size_t)j < Descriptors.size())
-			Descriptors.pop_back();
-
-	}
-
-	{ // dispatch heartbeats
-		if (gCurrentLoopTime >= NextHeartbeatTime) {
-			NextHeartbeatTime = gCurrentLoopTime + HeartbeatInterval;
-
-			for (unsigned int i=0; i < Descriptors.size(); i++) {
-				EventableDescriptor *ed = Descriptors[i];
-				assert (ed);
-				ed->Heartbeat();
-			}
-		}
-	}
-
-
 	// TODO, replace this with rb_thread_blocking_region for 1.9 builds.
 	#ifdef BUILD_FOR_RUBY
 	if (!rb_thread_alone()) {
@@ -675,6 +654,93 @@ bool EventMachine_t::_RunKqueueOnce()
 	#endif
 }
 
+
+/*********************************
+EventMachine_t::_TimeTilNextEvent
+*********************************/
+
+timeval EventMachine_t::_TimeTilNextEvent()
+{
+	uint64_t next_event = 0;
+
+	if (!Heartbeats.empty()) {
+		multimap<uint64_t,EventableDescriptor*>::iterator heartbeats = Heartbeats.begin();
+		next_event = heartbeats->first;
+	}
+
+	if (!Timers.empty()) {
+		multimap<uint64_t,Timer_t>::iterator timers = Timers.begin();
+		if (next_event == 0 || timers->first < next_event)
+			next_event = timers->first;
+	}
+
+	if (!NewDescriptors.empty() || !ModifiedDescriptors.empty()) {
+		next_event = MyCurrentLoopTime;
+	}
+
+	timeval tv;
+
+	if (next_event == 0) {
+		tv = Quantum;
+	} else {
+		if (next_event > MyCurrentLoopTime) {
+			uint64_t duration = next_event - MyCurrentLoopTime;
+			tv.tv_sec = duration / 1000000;
+			tv.tv_usec = duration % 1000000;
+		} else {
+			tv.tv_sec = tv.tv_usec = 0;
+		}
+	}
+
+	return tv;
+}
+
+/*******************************
+EventMachine_t::_CleanupSockets
+*******************************/
+
+void EventMachine_t::_CleanupSockets()
+{
+	// TODO, rip this out and only delete the descriptors we know have died,
+	// rather than traversing the whole list.
+	// Modified 05Jan08 per suggestions by Chris Heath. It's possible that
+	// an EventableDescriptor will have a descriptor value of -1. That will
+	// happen if EventableDescriptor::Close was called on it. In that case,
+	// don't call epoll_ctl to remove the socket's filters from the epoll set.
+	// According to the epoll docs, this happens automatically when the
+	// descriptor is closed anyway. This is different from the case where
+	// the socket has already been closed but the descriptor in the ED object
+	// hasn't yet been set to INVALID_SOCKET.
+	// In kqueue, closing a descriptor automatically removes its event filters.
+	int i, j;
+	int nSockets = Descriptors.size();
+	for (i=0, j=0; i < nSockets; i++) {
+		EventableDescriptor *ed = Descriptors[i];
+		assert (ed);
+		if (ed->ShouldDelete()) {
+		#ifdef HAVE_EPOLL
+			if (bEpoll) {
+				assert (epfd != -1);
+				if (ed->GetSocket() != INVALID_SOCKET) {
+					int e = epoll_ctl (epfd, EPOLL_CTL_DEL, ed->GetSocket(), ed->GetEpollEvent());
+					// ENOENT or EBADF are not errors because the socket may be already closed when we get here.
+					if (e && (errno != ENOENT) && (errno != EBADF) && (errno != EPERM)) {
+						char buf [200];
+						snprintf (buf, sizeof(buf)-1, "unable to delete epoll event: %s", strerror(errno));
+						throw std::runtime_error (buf);
+					}
+				}
+				ModifiedDescriptors.erase(ed);
+			}
+		#endif
+			delete ed;
+		}
+		else
+			Descriptors [j++] = ed;
+	}
+	while ((size_t)j < Descriptors.size())
+		Descriptors.pop_back();
+}
 
 /*********************************
 EventMachine_t::_ModifyEpollEvent
@@ -828,7 +894,7 @@ bool EventMachine_t::_RunSelectOnce()
 	{ // read and write the sockets
 		//timeval tv = {1, 0}; // Solaris fails if the microseconds member is >= 1000000.
 		//timeval tv = Quantum;
-		SelectData.tv = Quantum;
+		SelectData.tv = _TimeTilNextEvent();
 		int s = SelectData._Select();
 		//rb_thread_blocking_region(xxx,(void*)&SelectData,RUBY_UBF_IO,0);
 		//int s = EmSelect (SelectData.maxsocket+1, &(SelectData.fdreads), &(SelectData.fdwrites), NULL, &(SelectData.tv));
@@ -864,48 +930,54 @@ bool EventMachine_t::_RunSelectOnce()
 				_ReadLoopBreaker();
 		}
 		else if (s < 0) {
-			// select can fail on error in a handful of ways.
-			// If this happens, then wait for a little while to avoid busy-looping.
-			// If the error was EINTR, we probably caught SIGCHLD or something,
-			// so keep the wait short.
-			timeval tv = {0, ((errno == EINTR) ? 5 : 50) * 1000};
-			EmSelect (0, NULL, NULL, NULL, &tv);
-		}
-	}
-
-
-	{ // dispatch heartbeats
-		if (gCurrentLoopTime >= NextHeartbeatTime) {
-			NextHeartbeatTime = gCurrentLoopTime + HeartbeatInterval;
-
-			for (i=0; i < Descriptors.size(); i++) {
-				EventableDescriptor *ed = Descriptors[i];
-				assert (ed);
-				ed->Heartbeat();
+			switch (errno) {
+				case EBADF:
+					_CleanBadDescriptors();
+					break;
+				case EINVAL:
+					throw std::runtime_error ("Somehow EM passed an invalid nfds or invalid timeout to select(2), please report this!");
+					break;
+				default:
+					// select can fail on error in a handful of ways.
+					// If this happens, then wait for a little while to avoid busy-looping.
+					// If the error was EINTR, we probably caught SIGCHLD or something,
+					// so keep the wait short.
+					timeval tv = {0, ((errno == EINTR) ? 5 : 50) * 1000};
+					EmSelect (0, NULL, NULL, NULL, &tv);
 			}
 		}
-	}
-
-	{ // cleanup dying sockets
-		// vector::pop_back works in constant time.
-		int i, j;
-		int nSockets = Descriptors.size();
-		for (i=0, j=0; i < nSockets; i++) {
-			EventableDescriptor *ed = Descriptors[i];
-			assert (ed);
-			if (ed->ShouldDelete())
-				delete ed;
-			else
-				Descriptors [j++] = ed;
-		}
-		while ((size_t)j < Descriptors.size())
-			Descriptors.pop_back();
-
 	}
 
 	return true;
 }
 
+void EventMachine_t::_CleanBadDescriptors()
+{
+	size_t i;
+
+	for (i = 0; i < Descriptors.size(); i++) {
+		EventableDescriptor *ed = Descriptors[i];
+		if (ed->ShouldDelete())
+			continue;
+
+		int sd = ed->GetSocket();
+
+		struct timeval tv;
+		tv.tv_sec = 0;
+		tv.tv_usec = 0;
+
+		fd_set fds;
+		FD_ZERO(&fds);
+		FD_SET(sd, &fds);
+
+		int ret = select(sd + 1, &fds, NULL, NULL, &tv);
+
+		if (ret == -1) {
+			if (errno == EBADF)
+				ed->ScheduleClose(false);
+		}
+	}
+}
 
 /********************************
 EventMachine_t::_ReadLoopBreaker
@@ -920,7 +992,7 @@ void EventMachine_t::_ReadLoopBreaker()
 	char buffer [1024];
 	read (LoopBreakerReader, buffer, sizeof(buffer));
 	if (EventCallback)
-		(*EventCallback)(NULL, EM_LOOPBREAK_SIGNAL, "", 0);
+		(*EventCallback)(0, EM_LOOPBREAK_SIGNAL, "", 0);
 }
 
 
@@ -938,13 +1010,13 @@ bool EventMachine_t::_RunTimers()
 	// one that hasn't expired yet.
 
 	while (true) {
-		multimap<Int64,Timer_t>::iterator i = Timers.begin();
+		multimap<uint64_t,Timer_t>::iterator i = Timers.begin();
 		if (i == Timers.end())
 			break;
-		if (i->first > gCurrentLoopTime)
+		if (i->first > MyCurrentLoopTime)
 			break;
 		if (EventCallback)
-			(*EventCallback) (NULL, EM_TIMER_FIRED, NULL, i->second.GetBinding());
+			(*EventCallback) (0, EM_TIMER_FIRED, NULL, i->second.GetBinding());
 		Timers.erase (i);
 	}
 	return true;
@@ -963,28 +1035,31 @@ const unsigned long EventMachine_t::InstallOneshotTimer (int milliseconds)
 	// Don't use the global loop-time variable here, because we might
 	// get called before the main event machine is running.
 
+	// XXX This should be replaced with a call to _GetRealTime(), but I don't
+	// understand if this is a bug or not? For OS_UNIX we multiply the argument
+	// milliseconds by 1000, but for OS_WIN32 we do not? This needs to be sorted out.
 	#ifdef OS_UNIX
 	struct timeval tv;
 	gettimeofday (&tv, NULL);
-	Int64 fire_at = (((Int64)(tv.tv_sec)) * 1000000LL) + ((Int64)(tv.tv_usec));
-	fire_at += ((Int64)milliseconds) * 1000LL;
+	uint64_t fire_at = (((uint64_t)(tv.tv_sec)) * 1000000LL) + ((uint64_t)(tv.tv_usec));
+	fire_at += ((uint64_t)milliseconds) * 1000LL;
 	#endif
 
 	#ifdef OS_WIN32
 	unsigned tick = GetTickCount();
-	if (tick < gLastTickCount)
-		gTickCountTickover += 1;
-	gLastTickCount = tick;
+	if (tick < LastTickCount)
+		TickCountTickover += 1;
+	LastTickCount = tick;
 
-	Int64 fire_at = ((Int64)gTickCountTickover << 32) + (Int64)tick;
-	fire_at += (Int64)milliseconds;
+	uint64_t fire_at = ((uint64_t)TickCountTickover << 32) + (uint64_t)tick;
+	fire_at += (uint64_t)milliseconds;
 	#endif
 
 	Timer_t t;
 	#ifndef HAVE_MAKE_PAIR
-	multimap<Int64,Timer_t>::iterator i = Timers.insert (multimap<Int64,Timer_t>::value_type (fire_at, t));
+	multimap<uint64_t,Timer_t>::iterator i = Timers.insert (multimap<uint64_t,Timer_t>::value_type (fire_at, t));
 	#else
-	multimap<Int64,Timer_t>::iterator i = Timers.insert (make_pair (fire_at, t));
+	multimap<uint64_t,Timer_t>::iterator i = Timers.insert (make_pair (fire_at, t));
 	#endif
 	return i->second.GetBinding();
 }
@@ -1029,8 +1104,11 @@ const unsigned long EventMachine_t::ConnectToServer (const char *bind_addr, int 
 	bind_as = *bind_as_ptr; // copy because name2address points to a static
 
 	int sd = socket (family, SOCK_STREAM, 0);
-	if (sd == INVALID_SOCKET)
-		throw std::runtime_error ("unable to create new socket");
+	if (sd == INVALID_SOCKET) {
+		char buf [200];
+		snprintf (buf, sizeof(buf)-1, "unable to create new socket: %s", strerror(errno));
+		throw std::runtime_error (buf);
+	}
 
 	/*
 	sockaddr_in pin;
@@ -1063,7 +1141,7 @@ const unsigned long EventMachine_t::ConnectToServer (const char *bind_addr, int 
 	// From here on, ALL error returns must close the socket.
 	// Set the new socket nonblocking.
 	if (!SetSocketNonblocking (sd)) {
-		closesocket (sd);
+		close (sd);
 		throw std::runtime_error ("unable to set socket as non-blocking");
 	}
 	// Disable slow-start (Nagle algorithm).
@@ -1076,16 +1154,16 @@ const unsigned long EventMachine_t::ConnectToServer (const char *bind_addr, int 
 		int bind_to_size, bind_to_family;
 		struct sockaddr *bind_to = name2address (bind_addr, bind_port, &bind_to_family, &bind_to_size);
 		if (!bind_to) {
-			closesocket (sd);
+			close (sd);
 			throw std::runtime_error ("invalid bind address");
 		}
 		if (bind (sd, bind_to, bind_to_size) < 0) {
-			closesocket (sd);
+			close (sd);
 			throw std::runtime_error ("couldn't bind to address");
 		}
 	}
 
-	unsigned long out = NULL;
+	unsigned long out = 0;
 
 	#ifdef OS_UNIX
 	//if (connect (sd, (sockaddr*)&pin, sizeof pin) == 0) {
@@ -1134,29 +1212,31 @@ const unsigned long EventMachine_t::ConnectToServer (const char *bind_addr, int 
 			Add (cd);
 			out = cd->GetBinding();
 		}
-		else {
-			/* This could be connection refused or some such thing.
-			 * We will come here on Linux if a localhost connection fails.
-			 * Changed 16Jul06: Originally this branch was a no-op, and
-			 * we'd drop down to the end of the method, close the socket,
-			 * and return NULL, which would cause the caller to GET A
-			 * FATAL EXCEPTION. Now we keep the socket around but schedule an
-			 * immediate close on it, so the caller will get a close-event
-			 * scheduled on it. This was only an issue for localhost connections
-			 * to non-listening ports. We may eventually need to revise this
-			 * revised behavior, in case it causes problems like making it hard
-			 * for people to know that a failure occurred.
-			 */
-			ConnectionDescriptor *cd = new ConnectionDescriptor (sd, this);
-			if (!cd)
-				throw std::runtime_error ("no connection allocated");
-			cd->ScheduleClose (false);
-			Add (cd);
-			out = cd->GetBinding();
-		}
 	}
 	else {
-		// The error from connect was something other then EINPROGRESS.
+		// The error from connect was something other then EINPROGRESS (EHOSTDOWN, etc).
+		// Fall through to the !out case below
+	}
+
+	if (!out) {
+		/* This could be connection refused or some such thing.
+		 * We will come here on Linux if a localhost connection fails.
+		 * Changed 16Jul06: Originally this branch was a no-op, and
+		 * we'd drop down to the end of the method, close the socket,
+		 * and return NULL, which would cause the caller to GET A
+		 * FATAL EXCEPTION. Now we keep the socket around but schedule an
+		 * immediate close on it, so the caller will get a close-event
+		 * scheduled on it. This was only an issue for localhost connections
+		 * to non-listening ports. We may eventually need to revise this
+		 * revised behavior, in case it causes problems like making it hard
+		 * for people to know that a failure occurred.
+		 */
+		ConnectionDescriptor *cd = new ConnectionDescriptor (sd, this);
+		if (!cd)
+			throw std::runtime_error ("no connection allocated");
+		cd->ScheduleClose (false);
+		Add (cd);
+		out = cd->GetBinding();
 	}
 	#endif
 
@@ -1189,7 +1269,7 @@ const unsigned long EventMachine_t::ConnectToServer (const char *bind_addr, int 
 	#endif
 
 	if (!out)
-		closesocket (sd);
+		close (sd);
 	return out;
 }
 
@@ -1214,10 +1294,10 @@ const unsigned long EventMachine_t::ConnectToUnixServer (const char *server)
 	// The whole rest of this function is only compiled on Unix systems.
 	#ifdef OS_UNIX
 
-	unsigned long out = NULL;
+	unsigned long out = 0;
 
 	if (!server || !*server)
-		return NULL;
+		return 0;
 
 	sockaddr_un pun;
 	memset (&pun, 0, sizeof(pun));
@@ -1233,19 +1313,19 @@ const unsigned long EventMachine_t::ConnectToUnixServer (const char *server)
 
 	int fd = socket (AF_LOCAL, SOCK_STREAM, 0);
 	if (fd == INVALID_SOCKET)
-		return NULL;
+		return 0;
 
 	// From here on, ALL error returns must close the socket.
 	// NOTE: At this point, the socket is still a blocking socket.
 	if (connect (fd, (struct sockaddr*)&pun, sizeof(pun)) != 0) {
-		closesocket (fd);
-		return NULL;
+		close (fd);
+		return 0;
 	}
 
 	// Set the newly-connected socket nonblocking.
 	if (!SetSocketNonblocking (fd)) {
-		closesocket (fd);
-		return NULL;
+		close (fd);
+		return 0;
 	}
 
 	// Set up a connection descriptor and add it to the event-machine.
@@ -1260,7 +1340,7 @@ const unsigned long EventMachine_t::ConnectToUnixServer (const char *server)
 	out = cd->GetBinding();
 
 	if (!out)
-		closesocket (fd);
+		close (fd);
 
 	return out;
 	#endif
@@ -1448,9 +1528,9 @@ const unsigned long EventMachine_t::CreateTcpServer (const char *server, int por
 	int family, bind_size;
 	struct sockaddr *bind_here = name2address (server, port, &family, &bind_size);
 	if (!bind_here)
-		return NULL;
+		return 0;
 
-	unsigned long output_binding = NULL;
+	unsigned long output_binding = 0;
 
 	//struct sockaddr_in sin;
 
@@ -1529,8 +1609,8 @@ const unsigned long EventMachine_t::CreateTcpServer (const char *server, int por
 
 	fail:
 	if (sd_accept != INVALID_SOCKET)
-		closesocket (sd_accept);
-	return NULL;
+		close (sd_accept);
+	return 0;
 }
 
 
@@ -1540,7 +1620,7 @@ EventMachine_t::OpenDatagramSocket
 
 const unsigned long EventMachine_t::OpenDatagramSocket (const char *address, int port)
 {
-	unsigned long output_binding = NULL;
+	unsigned long output_binding = 0;
 
 	int sd = socket (AF_INET, SOCK_DGRAM, 0);
 	if (sd == INVALID_SOCKET)
@@ -1590,8 +1670,8 @@ const unsigned long EventMachine_t::OpenDatagramSocket (const char *address, int
 
 	fail:
 	if (sd != INVALID_SOCKET)
-		closesocket (sd);
-	return NULL;
+		close (sd);
+	return 0;
 }
 
 
@@ -1700,6 +1780,7 @@ void EventMachine_t::_AddNewDescriptors()
 		*/
 		#endif
 
+		QueueHeartbeat(ed);
 		Descriptors.push_back (ed);
 	}
 	NewDescriptors.clear();
@@ -1768,7 +1849,7 @@ const unsigned long EventMachine_t::_OpenFileForWriting (const char *filename)
 	 */
 
 	if (!filename || !*filename)
-		return NULL;
+		return 0;
 
   int fd = open (filename, O_CREAT|O_TRUNC|O_WRONLY|O_NONBLOCK, 0644);
   
@@ -1800,7 +1881,7 @@ const unsigned long EventMachine_t::CreateUnixDomainServer (const char *filename
 
 	// The whole rest of this function is only compiled on Unix systems.
 	#ifdef OS_UNIX
-	unsigned long output_binding = NULL;
+	unsigned long output_binding = 0;
 
 	struct sockaddr_un s_sun;
 
@@ -1860,8 +1941,8 @@ const unsigned long EventMachine_t::CreateUnixDomainServer (const char *filename
 
 	fail:
 	if (sd_accept != INVALID_SOCKET)
-		closesocket (sd_accept);
-	return NULL;
+		close (sd_accept);
+	return 0;
 	#endif // OS_UNIX
 }
 
@@ -1922,18 +2003,18 @@ const unsigned long EventMachine_t::Socketpair (char * const*cmd_strings)
 	#ifdef OS_UNIX
 	// Make sure the incoming array of command strings is sane.
 	if (!cmd_strings)
-		return NULL;
+		return 0;
 	int j;
-	for (j=0; j < 100 && cmd_strings[j]; j++)
+	for (j=0; j < 2048 && cmd_strings[j]; j++)
 		;
-	if ((j==0) || (j==100))
-		return NULL;
+	if ((j==0) || (j==2048))
+		return 0;
 
-	unsigned long output_binding = NULL;
+	unsigned long output_binding = 0;
 
 	int sv[2];
 	if (socketpair (AF_LOCAL, SOCK_STREAM, 0, sv) < 0)
-		return NULL;
+		return 0;
 	// from here, all early returns must close the pair of sockets.
 
 	// Set the parent side of the socketpair nonblocking.
@@ -1943,7 +2024,7 @@ const unsigned long EventMachine_t::Socketpair (char * const*cmd_strings)
 	if (!SetSocketNonblocking (sv[0])) {
 		close (sv[0]);
 		close (sv[1]);
-		return NULL;
+		return 0;
 	}
 
 	pid_t f = fork();
@@ -2092,7 +2173,8 @@ const unsigned long EventMachine_t::WatchFile (const char *fpath)
 		Add(inotify);
 	}
 
-	wd = inotify_add_watch(inotify->GetSocket(), fpath, IN_MODIFY | IN_DELETE_SELF | IN_MOVE_SELF);
+	wd = inotify_add_watch(inotify->GetSocket(), fpath,
+			       IN_MODIFY | IN_DELETE_SELF | IN_MOVE_SELF | IN_CREATE | IN_DELETE | IN_MOVE) ;
 	if (wd == -1) {
 		char errbuf[300];
 		sprintf(errbuf, "failed to open file %s for registering with inotify: %s", fpath, strerror(errno));
@@ -2168,19 +2250,33 @@ EventMachine_t::_ReadInotify_Events
 void EventMachine_t::_ReadInotifyEvents()
 {
 	#ifdef HAVE_INOTIFY
-	struct inotify_event event;
+	char buffer[1024];
 
 	assert(EventCallback);
 
-	while (read(inotify->GetSocket(), &event, INOTIFY_EVENT_SIZE) > 0) {
-		assert(event.len == 0);
-		if (event.mask & IN_MODIFY)
-			(*EventCallback)(Files [event.wd]->GetBinding(), EM_CONNECTION_READ, "modified", 8);
-		if (event.mask & IN_MOVE_SELF)
-			(*EventCallback)(Files [event.wd]->GetBinding(), EM_CONNECTION_READ, "moved", 5);
-		if (event.mask & IN_DELETE_SELF) {
-			(*EventCallback)(Files [event.wd]->GetBinding(), EM_CONNECTION_READ, "deleted", 7);
-			UnwatchFile ((int)event.wd);
+	for (;;) {
+		int returned = read(inotify->GetSocket(), buffer, sizeof(buffer));
+		assert(!(returned == 0 || returned == -1 && errno == EINVAL));
+		if (returned <= 0) {
+		    break;
+		}
+		int current = 0;
+		while (current < returned) {
+			struct inotify_event* event = (struct inotify_event*)(buffer+current);
+			map<int, Bindable_t*>::const_iterator bindable = Files.find(event->wd);
+			if (bindable != Files.end()) {
+				if (event->mask & (IN_MODIFY | IN_CREATE | IN_DELETE | IN_MOVE)){
+					(*EventCallback)(bindable->second->GetBinding(), EM_CONNECTION_READ, "modified", 8);
+				}
+				if (event->mask & IN_MOVE_SELF){
+					(*EventCallback)(bindable->second->GetBinding(), EM_CONNECTION_READ, "moved", 5);
+				}
+				if (event->mask & IN_DELETE_SELF) {
+					(*EventCallback)(bindable->second->GetBinding(), EM_CONNECTION_READ, "deleted", 7);
+					UnwatchFile ((int)event->wd);
+				}
+			}
+			current += sizeof(struct inotify_event) + event->len;
 		}
 	}
 	#endif

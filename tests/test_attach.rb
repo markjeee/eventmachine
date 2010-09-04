@@ -46,8 +46,18 @@ class TestAttach < Test::Unit::TestCase
     def unbind
       EM.next_tick do
         $sock.write("def\n")
-        EM.add_timer(0.5){ EM.stop }
+        EM.add_timer(0.1){ EM.stop }
       end
+    end
+  end
+
+  def setup
+    $read, $write, $sock, $r, $w, $fd, $sock, $before, $after = nil
+  end
+
+  def teardown
+    [$read, $write, $sock, $r, $w, $fd, $sock, $before, $after].each do |io|
+      io.close rescue nil
     end
   end
 
@@ -88,8 +98,8 @@ class TestAttach < Test::Unit::TestCase
   def test_set_readable
     EM.run{
       $r, $w = IO.pipe
-      c = EM.watch $r, PipeWatch do |c|
-        c.notify_readable = false
+      c = EM.watch $r, PipeWatch do |con|
+        con.notify_readable = false
       end
 
       EM.next_tick{

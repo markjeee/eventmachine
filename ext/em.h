@@ -57,15 +57,6 @@ See the file COPYING for complete licensing information.
   #define EmSelect select
 #endif
 
-#ifdef OS_UNIX
-typedef long long Int64;
-#endif
-#ifdef OS_WIN32
-typedef __int64 Int64;
-#endif
-
-extern Int64 gCurrentLoopTime;
-
 class EventableDescriptor;
 class InotifyDescriptor;
 
@@ -141,12 +132,19 @@ class EventMachine_t
 		void _HandleKqueuePidEvent (struct kevent*);
 		#endif
 
+		uint64_t GetCurrentLoopTime() { return MyCurrentLoopTime; }
+
 		// Temporary:
 		void _UseEpoll();
 		void _UseKqueue();
 
 		bool UsingKqueue() { return bKqueue; }
 		bool UsingEpoll() { return bEpoll; }
+
+		void QueueHeartbeat(EventableDescriptor*);
+		void ClearHeartbeat(uint64_t);
+
+		uint64_t GetRealTime();
 
 	private:
 		bool _RunOnce();
@@ -155,12 +153,16 @@ class EventMachine_t
 		void _AddNewDescriptors();
 		void _ModifyDescriptors();
 		void _InitializeLoopBreaker();
+		void _CleanupSockets();
 
 		bool _RunSelectOnce();
 		bool _RunEpollOnce();
 		bool _RunKqueueOnce();
 
 		void _ModifyEpollEvent (EventableDescriptor*);
+		void _DispatchHeartbeats();
+		timeval _TimeTilNextEvent();
+		void _CleanBadDescriptors();
 
 	public:
 		void _ReadLoopBreaker();
@@ -177,14 +179,15 @@ class EventMachine_t
 		class Timer_t: public Bindable_t {
 		};
 
-		multimap<Int64, Timer_t> Timers;
+		multimap<uint64_t, Timer_t> Timers;
+		multimap<uint64_t, EventableDescriptor*> Heartbeats;
 		map<int, Bindable_t*> Files;
 		map<int, Bindable_t*> Pids;
 		vector<EventableDescriptor*> Descriptors;
 		vector<EventableDescriptor*> NewDescriptors;
 		set<EventableDescriptor*> ModifiedDescriptors;
 
-		Int64 NextHeartbeatTime;
+		uint64_t NextHeartbeatTime;
 
 		int LoopBreakerReader;
 		int LoopBreakerWriter;
@@ -193,6 +196,13 @@ class EventMachine_t
 		#endif
 
 		timeval Quantum;
+
+		uint64_t MyCurrentLoopTime;
+
+		#ifdef OS_WIN32
+		unsigned TickCountTickover;
+		unsigned LastTickCount;
+		#endif
 
 	private:
 		bool bEpoll;

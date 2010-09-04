@@ -121,7 +121,8 @@ class TestHttpClient2 < Test::Unit::TestCase
       e.callback {
         headers2 = e.headers
       }
-      EM::Timer.new(1) {EM.stop}
+      EM.tick_loop { EM.stop if headers && headers2 }
+      EM.add_timer(1) { EM.stop }
     }
     assert(headers)
     assert(headers2)
@@ -141,7 +142,7 @@ class TestHttpClient2 < Test::Unit::TestCase
   def test_https_get
     d = nil
     EM.run {
-      http = EM::P::HttpClient2.connect :host => 'www.amazon.com', :port => 443, :ssl => true
+      http = EM::P::HttpClient2.connect :host => 'www.apple.com', :port => 443, :ssl => true
       d = http.get "/"
       d.callback {
         EM.stop

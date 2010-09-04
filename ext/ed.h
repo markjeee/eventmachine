@@ -75,22 +75,26 @@ class EventableDescriptor: public Bindable_t
 		virtual X509 *GetPeerCert() {return NULL;}
 		#endif
 
-		virtual float GetCommInactivityTimeout() {return 0.0;}
-		virtual int SetCommInactivityTimeout (float value) {return 0;}
-		float GetPendingConnectTimeout();
-		int SetPendingConnectTimeout (float value);
+		virtual uint64_t GetCommInactivityTimeout() {return 0;}
+		virtual int SetCommInactivityTimeout (uint64_t value) {return 0;}
+		uint64_t GetPendingConnectTimeout();
+		int SetPendingConnectTimeout (uint64_t value);
 
 		#ifdef HAVE_EPOLL
 		struct epoll_event *GetEpollEvent() { return &EpollEvent; }
 		#endif
 
-		virtual void StartProxy(const unsigned long, const unsigned long);
+		virtual void StartProxy(const unsigned long, const unsigned long, const unsigned long);
 		virtual void StopProxy();
 		virtual void SetProxiedFrom(EventableDescriptor*, const unsigned long);
 		virtual int SendOutboundData(const char*,int){ return -1; }
 		virtual bool IsPaused(){ return false; }
 		virtual bool Pause(){ return false; }
 		virtual bool Resume(){ return false; }
+
+		virtual int ReportErrorStatus(){ return 0; }
+		virtual bool IsConnectPending(){ return false; }
+		virtual uint64_t GetNextHeartbeat();
 
 	private:
 		bool bCloseNow;
@@ -102,9 +106,11 @@ class EventableDescriptor: public Bindable_t
 		EMCallback EventCallback;
 		void _GenericInboundDispatch(const char*, int);
 
-		Int64 CreatedAt;
+		uint64_t CreatedAt;
 		bool bCallbackUnbind;
 		int UnbindReasonCode;
+
+		unsigned long BytesToProxy;
 		EventableDescriptor *ProxyTarget;
 		EventableDescriptor *ProxiedFrom;
 
@@ -115,7 +121,10 @@ class EventableDescriptor: public Bindable_t
 		#endif
 
 		EventMachine_t *MyEventMachine;
-		int PendingConnectTimeout;
+		uint64_t PendingConnectTimeout;
+		uint64_t InactivityTimeout;
+		uint64_t LastActivity;
+		uint64_t NextHeartbeat;
 };
 
 
@@ -148,10 +157,6 @@ class ConnectionDescriptor: public EventableDescriptor
 	public:
 		ConnectionDescriptor (int, EventMachine_t*);
 		virtual ~ConnectionDescriptor();
-
-		static int SendDataToConnection (const unsigned long, const char*, int);
-		static void CloseConnection (const unsigned long, bool);
-		static int ReportErrorStatus (const unsigned long);
 
 		int SendOutboundData (const char*, int);
 
@@ -195,9 +200,11 @@ class ConnectionDescriptor: public EventableDescriptor
 		virtual bool GetPeername (struct sockaddr*);
 		virtual bool GetSockname (struct sockaddr*);
 
-		virtual float GetCommInactivityTimeout();
-		virtual int SetCommInactivityTimeout (float value);
+		virtual uint64_t GetCommInactivityTimeout();
+		virtual int SetCommInactivityTimeout (uint64_t value);
 
+		virtual int ReportErrorStatus();
+		virtual bool IsConnectPending(){ return bConnectPending; }
 
 	protected:
 		struct OutboundPage {
@@ -236,8 +243,6 @@ class ConnectionDescriptor: public EventableDescriptor
 		#endif
 
 		bool bIsServer;
-		Int64 LastIo;
-		int InactivityTimeout;
 
 	private:
 		void _UpdateEvents();
@@ -246,7 +251,6 @@ class ConnectionDescriptor: public EventableDescriptor
 		void _DispatchInboundData (const char *buffer, int size);
 		void _DispatchCiphertext();
 		int _SendRawOutboundData (const char*, int);
-		int _ReportErrorStatus();
 		void _CheckHandshakeStatus();
 
 };
@@ -278,11 +282,8 @@ class DatagramDescriptor: public EventableDescriptor
 		virtual bool GetPeername (struct sockaddr*);
 		virtual bool GetSockname (struct sockaddr*);
 
-    virtual float GetCommInactivityTimeout();
-    virtual int SetCommInactivityTimeout (float value);
-
-		static int SendDatagram (const unsigned long, const char*, int, const char*, int);
-
+		virtual uint64_t GetCommInactivityTimeout();
+		virtual int SetCommInactivityTimeout (uint64_t value);
 
 	protected:
 		struct OutboundPage {
@@ -298,9 +299,6 @@ class DatagramDescriptor: public EventableDescriptor
 		int OutboundDataSize;
 
 		struct sockaddr_in ReturnAddress;
-
-		Int64 LastIo;
-		int InactivityTimeout;
 };
 
 
@@ -360,8 +358,6 @@ class PipeDescriptor: public EventableDescriptor
 
 	protected:
 		bool bReadAttemptedAfterClose;
-		Int64 LastIo;
-		int InactivityTimeout;
 
 		deque<OutboundPage> OutboundPages;
 		int OutboundDataSize;
@@ -393,8 +389,6 @@ class KeyboardDescriptor: public EventableDescriptor
 
 	protected:
 		bool bReadAttemptedAfterClose;
-		Int64 LastIo;
-		int InactivityTimeout;
 
 	private:
 		void _DispatchInboundData (const char *buffer, int size);

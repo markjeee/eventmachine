@@ -61,7 +61,8 @@ EventableDescriptor::EventableDescriptor (int sd, EventMachine_t *em):
 	ProxiedFrom(NULL),
 	MaxOutboundBufSize(0),
 	MyEventMachine (em),
-	PendingConnectTimeout(20000000)
+	PendingConnectTimeout(20000000),
+	InactivityTimeout (0)
 {
 	/* There are three ways to close a socket, all of which should
 	 * automatically signal to the event machine that this object
@@ -88,12 +89,13 @@ EventableDescriptor::EventableDescriptor (int sd, EventMachine_t *em):
 		throw std::runtime_error ("bad eventable descriptor");
 	if (MyEventMachine == NULL)
 		throw std::runtime_error ("bad em in eventable descriptor");
-	CreatedAt = gCurrentLoopTime;
+	CreatedAt = MyEventMachine->GetCurrentLoopTime();
 
 	#ifdef HAVE_EPOLL
 	EpollEvent.events = 0;
 	EpollEvent.data.ptr = this;
 	#endif
+	LastActivity = MyEventMachine->GetCurrentLoopTime();
 }
 
 
@@ -103,6 +105,8 @@ EventableDescriptor::~EventableDescriptor
 
 EventableDescriptor::~EventableDescriptor()
 {
+	if (NextHeartbeat)
+		MyEventMachine->ClearHeartbeat(NextHeartbeat);
 	if (EventCallback && bCallbackUnbind)
 		(*EventCallback)(GetBinding(), EM_CONNECTION_UNBOUND, NULL, UnbindReasonCode);
 	if (ProxiedFrom) {
@@ -133,7 +137,7 @@ void EventableDescriptor::Close()
 	// Close the socket right now. Intended for emergencies.
 	if (MySocket != INVALID_SOCKET) {
 		shutdown (MySocket, 1);
-		closesocket (MySocket);
+		close (MySocket);
 		MySocket = INVALID_SOCKET;
 	}
 }
@@ -187,12 +191,13 @@ bool EventableDescriptor::IsCloseScheduled()
 EventableDescriptor::StartProxy
 *******************************/
 
-void EventableDescriptor::StartProxy(const unsigned long to, const unsigned long bufsize)
+void EventableDescriptor::StartProxy(const unsigned long to, const unsigned long bufsize, const unsigned long length)
 {
 	EventableDescriptor *ed = dynamic_cast <EventableDescriptor*> (Bindable_t::GetObject (to));
 	if (ed) {
 		StopProxy();
 		ProxyTarget = ed;
+		BytesToProxy = length;
 		ed->SetProxiedFrom(this, bufsize);
 		return;
 	}
@@ -232,10 +237,24 @@ void EventableDescriptor::_GenericInboundDispatch(const char *buf, int size)
 {
 	assert(EventCallback);
 
-	if (ProxyTarget)
-		ProxyTarget->SendOutboundData(buf, size);
-	else
+	if (ProxyTarget) {
+		if (BytesToProxy > 0) {
+			unsigned long proxied = std::min(BytesToProxy, (unsigned long) size);
+			ProxyTarget->SendOutboundData(buf, proxied);
+			BytesToProxy -= proxied;
+			if (BytesToProxy == 0) {
+				StopProxy();
+				(*EventCallback)(GetBinding(), EM_PROXY_COMPLETED, NULL, 0);
+				if (proxied < size) {
+					(*EventCallback)(GetBinding(), EM_CONNECTION_READ, buf + proxied, size - proxied);
+				}
+			}
+		} else {
+			ProxyTarget->SendOutboundData(buf, size);
+		}
+	} else {
 		(*EventCallback)(GetBinding(), EM_CONNECTION_READ, buf, size);
+	}
 }
 
 
@@ -243,9 +262,9 @@ void EventableDescriptor::_GenericInboundDispatch(const char *buf, int size)
 EventableDescriptor::GetPendingConnectTimeout
 *********************************************/
 
-float EventableDescriptor::GetPendingConnectTimeout()
+uint64_t EventableDescriptor::GetPendingConnectTimeout()
 {
-	return ((float)PendingConnectTimeout / 1000000);
+	return PendingConnectTimeout / 1000;
 }
 
 
@@ -253,13 +272,40 @@ float EventableDescriptor::GetPendingConnectTimeout()
 EventableDescriptor::SetPendingConnectTimeout
 *********************************************/
 
-int EventableDescriptor::SetPendingConnectTimeout (float value)
+int EventableDescriptor::SetPendingConnectTimeout (uint64_t value)
 {
 	if (value > 0) {
-		PendingConnectTimeout = (Int64)(value * 1000000);
+		PendingConnectTimeout = value * 1000;
+		MyEventMachine->QueueHeartbeat(this);
 		return 1;
 	}
 	return 0;
+}
+
+
+/*************************************
+EventableDescriptor::GetNextHeartbeat
+*************************************/
+
+uint64_t EventableDescriptor::GetNextHeartbeat()
+{
+	if (NextHeartbeat)
+		MyEventMachine->ClearHeartbeat(NextHeartbeat);
+
+	NextHeartbeat = 0;
+
+	if (!ShouldDelete()) {
+		uint64_t time_til_next = GetCommInactivityTimeout() * 1000;
+		if (IsConnectPending()) {
+			if (time_til_next == 0 || PendingConnectTimeout < time_til_next)
+				time_til_next = PendingConnectTimeout;
+		}
+		if (time_til_next == 0)
+			return 0;
+		NextHeartbeat = time_til_next + MyEventMachine->GetRealTime();
+	}
+
+	return NextHeartbeat;
 }
 
 
@@ -286,9 +332,7 @@ ConnectionDescriptor::ConnectionDescriptor (int sd, EventMachine_t *em):
 	#ifdef HAVE_KQUEUE
 	bGotExtraKqueueEvent(false),
 	#endif
-	bIsServer (false),
-	LastIo (gCurrentLoopTime),
-	InactivityTimeout (0)
+	bIsServer (false)
 {
 	// 22Jan09: Moved ArmKqueueWriter into SetConnectPending() to fix assertion failure in _WriteOutboundData()
 	//  5May09: Moved EPOLLOUT into SetConnectPending() so it doesn't happen for attached read pipes
@@ -311,57 +355,6 @@ ConnectionDescriptor::~ConnectionDescriptor()
 	#endif
 }
 
-
-/**************************************************
-STATIC: ConnectionDescriptor::SendDataToConnection
-**************************************************/
-
-int ConnectionDescriptor::SendDataToConnection (const unsigned long binding, const char *data, int data_length)
-{
-	// TODO: This is something of a hack, or at least it's a static method of the wrong class.
-	// TODO: Poor polymorphism here. We should be calling one virtual method
-	// instead of hacking out the runtime information of the target object.
-	ConnectionDescriptor *cd = dynamic_cast <ConnectionDescriptor*> (Bindable_t::GetObject (binding));
-	if (cd)
-		return cd->SendOutboundData (data, data_length);
-	DatagramDescriptor *ds = dynamic_cast <DatagramDescriptor*> (Bindable_t::GetObject (binding));
-	if (ds)
-		return ds->SendOutboundData (data, data_length);
-	#ifdef OS_UNIX
-	PipeDescriptor *ps = dynamic_cast <PipeDescriptor*> (Bindable_t::GetObject (binding));
-	if (ps)
-		return ps->SendOutboundData (data, data_length);
-	#endif
-	return -1;
-}
-
-
-/*********************************************
-STATIC: ConnectionDescriptor::CloseConnection
-*********************************************/
-
-void ConnectionDescriptor::CloseConnection (const unsigned long binding, bool after_writing)
-{
-	// TODO: This is something of a hack, or at least it's a static method of the wrong class.
-	EventableDescriptor *ed = dynamic_cast <EventableDescriptor*> (Bindable_t::GetObject (binding));
-	if (ed)
-		ed->ScheduleClose (after_writing);
-}
-
-/***********************************************
-STATIC: ConnectionDescriptor::ReportErrorStatus
-***********************************************/
-
-int ConnectionDescriptor::ReportErrorStatus (const unsigned long binding)
-{
-	// TODO: This is something of a hack, or at least it's a static method of the wrong class.
-	// TODO: Poor polymorphism here. We should be calling one virtual method
-	// instead of hacking out the runtime information of the target object.
-	ConnectionDescriptor *cd = dynamic_cast <ConnectionDescriptor*> (Bindable_t::GetObject (binding));
-	if (cd)
-		return cd->_ReportErrorStatus();
-	return -1;
-}
 
 /***********************************
 ConnectionDescriptor::_UpdateEvents
@@ -500,7 +493,7 @@ int ConnectionDescriptor::SendOutboundData (const char *data, int length)
 	if (bWatchOnly)
 		throw std::runtime_error ("cannot send data on a 'watch only' connection");
 
-	if (ProxiedFrom && MaxOutboundBufSize && GetOutboundDataSize() + length > MaxOutboundBufSize)
+	if (ProxiedFrom && MaxOutboundBufSize && (unsigned int)(GetOutboundDataSize() + length) > MaxOutboundBufSize)
 		ProxiedFrom->Pause();
 
 	#ifdef WITH_SSL
@@ -541,7 +534,11 @@ int ConnectionDescriptor::_SendRawOutboundData (const char *data, int length)
 	// (Well, not so bad, small pages are coalesced in ::Write)
 
 	if (IsCloseScheduled())
-	//if (bCloseNow || bCloseAfterWriting)
+		return 0;
+
+	// 25Mar10: Ignore 0 length packets as they are not meaningful in TCP (as opposed to UDP)
+	// and can cause the assert(nbytes>0) to fail when OutboundPages has a bunch of 0 length pages.
+	if (length == 0)
 		return 0;
 
 	if (!data && (length > 0))
@@ -688,7 +685,7 @@ void ConnectionDescriptor::Read()
 		return;
 	}
 
-	LastIo = gCurrentLoopTime;
+	LastActivity = MyEventMachine->GetCurrentLoopTime();
 
 	int total_bytes_read = 0;
 	char readbuffer [16 * 1024 + 1];
@@ -894,7 +891,7 @@ void ConnectionDescriptor::_WriteOutboundData()
 		return;
 	}
 
-	LastIo = gCurrentLoopTime;
+	LastActivity = MyEventMachine->GetCurrentLoopTime();
 	size_t nbytes = 0;
 
 	#ifdef HAVE_WRITEV
@@ -961,7 +958,7 @@ void ConnectionDescriptor::_WriteOutboundData()
 	assert (bytes_written >= 0);
 	OutboundDataSize -= bytes_written;
 
-	if (ProxiedFrom && MaxOutboundBufSize && GetOutboundDataSize() < MaxOutboundBufSize && ProxiedFrom->IsPaused())
+	if (ProxiedFrom && MaxOutboundBufSize && (unsigned int)GetOutboundDataSize() < MaxOutboundBufSize && ProxiedFrom->IsPaused())
 		ProxiedFrom->Resume();
 
 	#ifdef HAVE_WRITEV
@@ -1013,11 +1010,11 @@ void ConnectionDescriptor::_WriteOutboundData()
 }
 
 
-/****************************************
-ConnectionDescriptor::_ReportErrorStatus
-****************************************/
+/***************************************
+ConnectionDescriptor::ReportErrorStatus
+***************************************/
 
-int ConnectionDescriptor::_ReportErrorStatus()
+int ConnectionDescriptor::ReportErrorStatus()
 {
 	int error;
 	socklen_t len;
@@ -1198,12 +1195,12 @@ void ConnectionDescriptor::Heartbeat()
 	 */
 
 	if (bConnectPending) {
-		if ((gCurrentLoopTime - CreatedAt) >= PendingConnectTimeout)
+		if ((MyEventMachine->GetCurrentLoopTime() - CreatedAt) >= PendingConnectTimeout)
 			ScheduleClose (false);
 			//bCloseNow = true;
 	}
 	else {
-		if (InactivityTimeout && ((gCurrentLoopTime - LastIo) >= InactivityTimeout))
+		if (InactivityTimeout && ((MyEventMachine->GetCurrentLoopTime() - LastActivity) >= InactivityTimeout))
 			ScheduleClose (false);
 			//bCloseNow = true;
 	}
@@ -1336,7 +1333,7 @@ void AcceptorDescriptor::Read()
 		//int val = fcntl (sd, F_GETFL, 0);
 		//if (fcntl (sd, F_SETFL, val | O_NONBLOCK) == -1) {
 			shutdown (sd, 1);
-			closesocket (sd);
+			close (sd);
 			continue;
 		}
 
@@ -1413,9 +1410,7 @@ DatagramDescriptor::DatagramDescriptor
 
 DatagramDescriptor::DatagramDescriptor (int sd, EventMachine_t *parent_em):
 	EventableDescriptor (sd, parent_em),
-	OutboundDataSize (0),
-	LastIo (gCurrentLoopTime),
-	InactivityTimeout (0)
+	OutboundDataSize (0)
 {
 	memset (&ReturnAddress, 0, sizeof(ReturnAddress));
 
@@ -1469,7 +1464,7 @@ void DatagramDescriptor::Heartbeat()
 {
 	// Close it if its inactivity timer has expired.
 
-	if (InactivityTimeout && ((gCurrentLoopTime - LastIo) >= InactivityTimeout))
+	if (InactivityTimeout && ((MyEventMachine->GetCurrentLoopTime() - LastActivity) >= InactivityTimeout))
 		ScheduleClose (false);
 		//bCloseNow = true;
 }
@@ -1483,7 +1478,7 @@ void DatagramDescriptor::Read()
 {
 	int sd = GetSocket();
 	assert (sd != INVALID_SOCKET);
-	LastIo = gCurrentLoopTime;
+	LastActivity = MyEventMachine->GetCurrentLoopTime();
 
 	// This is an extremely large read buffer.
 	// In many cases you wouldn't expect to get any more than 4K.
@@ -1560,7 +1555,7 @@ void DatagramDescriptor::Write()
 
 	int sd = GetSocket();
 	assert (sd != INVALID_SOCKET);
-	LastIo = gCurrentLoopTime;
+	LastActivity = MyEventMachine->GetCurrentLoopTime();
 
 	assert (OutboundPages.size() > 0);
 
@@ -1626,11 +1621,11 @@ DatagramDescriptor::SendOutboundData
 
 int DatagramDescriptor::SendOutboundData (const char *data, int length)
 {
-	// This is an exact clone of ConnectionDescriptor::SendOutboundData.
-	// That means it needs to move to a common ancestor.
+	// This is almost an exact clone of ConnectionDescriptor::_SendRawOutboundData.
+	// That means most of it could be factored to a common ancestor. Note that
+	// empty datagrams are meaningful, which isn't the case for TCP streams.
 
 	if (IsCloseScheduled())
-	//if (bCloseNow || bCloseAfterWriting)
 		return 0;
 
 	if (!data && (length > 0))
@@ -1714,20 +1709,6 @@ int DatagramDescriptor::SendOutboundDatagram (const char *data, int length, cons
 }
 
 
-/****************************************
-STATIC: DatagramDescriptor::SendDatagram
-****************************************/
-
-int DatagramDescriptor::SendDatagram (const unsigned long binding, const char *data, int length, const char *address, int port)
-{
-	DatagramDescriptor *dd = dynamic_cast <DatagramDescriptor*> (Bindable_t::GetObject (binding));
-	if (dd)
-		return dd->SendOutboundDatagram (data, length, address, port);
-	else
-		return -1;
-}
-
-
 /*********************************
 ConnectionDescriptor::GetPeername
 *********************************/
@@ -1765,9 +1746,9 @@ bool ConnectionDescriptor::GetSockname (struct sockaddr *s)
 ConnectionDescriptor::GetCommInactivityTimeout
 **********************************************/
 
-float ConnectionDescriptor::GetCommInactivityTimeout()
+uint64_t ConnectionDescriptor::GetCommInactivityTimeout()
 {
-	return ((float)InactivityTimeout / 1000000);
+	return InactivityTimeout / 1000;
 }
 
 
@@ -1775,13 +1756,11 @@ float ConnectionDescriptor::GetCommInactivityTimeout()
 ConnectionDescriptor::SetCommInactivityTimeout
 **********************************************/
 
-int ConnectionDescriptor::SetCommInactivityTimeout (float value)
+int ConnectionDescriptor::SetCommInactivityTimeout (uint64_t value)
 {
-	if (value > 0) {
-		InactivityTimeout = (Int64)(value * 1000000);
-		return 1;
-	}
-	return 0;
+	InactivityTimeout = value * 1000;
+	MyEventMachine->QueueHeartbeat(this);
+	return 1;
 }
 
 /*******************************
@@ -1821,19 +1800,20 @@ bool DatagramDescriptor::GetSockname (struct sockaddr *s)
 DatagramDescriptor::GetCommInactivityTimeout
 ********************************************/
 
-float DatagramDescriptor::GetCommInactivityTimeout()
+uint64_t DatagramDescriptor::GetCommInactivityTimeout()
 {
-	return ((float)InactivityTimeout / 1000000);
+	return InactivityTimeout / 1000;
 }
 
 /********************************************
 DatagramDescriptor::SetCommInactivityTimeout
 ********************************************/
 
-int DatagramDescriptor::SetCommInactivityTimeout (float value)
+int DatagramDescriptor::SetCommInactivityTimeout (uint64_t value)
 {
 	if (value > 0) {
-		InactivityTimeout = (Int64)(value * 1000000);
+		InactivityTimeout = value * 1000;
+		MyEventMachine->QueueHeartbeat(this);
 		return 1;
 	}
 	return 0;
