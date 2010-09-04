@@ -116,7 +116,7 @@ of EventMachine is to enable programs to easily interface with other programs
 using TCP/IP, especially if custom protocols are required.
   EOD
 
-  require 'lib/em/version'
+  require File.join(File.dirname(__FILE__), 'lib/em/version')
   s.version = EventMachine::VERSION
 end
 
@@ -195,7 +195,7 @@ namespace :ext do
   file ext_libname => ext_sources + ['ext/Makefile'] do
     chdir('ext') { sh MAKE }
   end
-  
+
   file ffr_libname => ffr_sources + ['ext/fastfilereader/Makefile'] do
     chdir('ext/fastfilereader') { sh MAKE }
   end
@@ -317,7 +317,7 @@ task :docs => :rdoc do
   case RUBY_PLATFORM
   when /darwin/       ; sh 'open rdoc/index.html'
   when /mswin|mingw/  ; sh 'start rdoc\index.html'
-  else 
+  else
     sh 'firefox rdoc/index.html'
   end
 end
@@ -351,7 +351,7 @@ Rake::Task[:clean].enhance [:clobber_package]
 
 namespace :gem do
   desc 'Install gem (and sudo if required)'
-  task :install => :package do 
+  task :install => :package do
     gem_cmd(:install, "pkg/#{Spec.name}-#{Spec.version}.gem")
   end
 
@@ -359,7 +359,7 @@ namespace :gem do
   task :uninstall do
     gem_cmd(:uninstall, "#{Spec.name}", "-v=#{Spec.version}")
   end
-  
+
   desc "Generate new gemspec"
   task :spec => :clobber do
     open("eventmachine.gemspec", 'w') { |f| f.write Spec.to_ruby }
